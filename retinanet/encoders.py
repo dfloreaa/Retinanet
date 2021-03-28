@@ -5,8 +5,14 @@ import torch.nn.functional as F
 import torch
 import torch.utils.model_zoo as model_zoo
 
+<<<<<<< HEAD
 from .utils import BasicBlock, Bottleneck, BBoxTransform, ClipBoxes
 from .anchors import Anchors
+=======
+from utils import BasicBlock, Bottleneck, BBoxTransform, ClipBoxes
+from anchors import Anchors
+import losses
+>>>>>>> cf129a0aec86474c0301cb1640bd781f2d58f640
 
 from pretrainedmodels.models import senet
 from torchsummary import summary

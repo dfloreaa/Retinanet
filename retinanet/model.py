@@ -3,10 +3,17 @@ import torch
 import math
 import torch.utils.model_zoo as model_zoo
 from torchvision.ops import nms
+<<<<<<< HEAD
 from .utils import BasicBlock, Bottleneck, BBoxTransform, ClipBoxes
 from .anchors import Anchors
 from .losses import calc_iou, FocalLoss
 from .encoders import SeResNetXtEncoder, ResNetEncoder
+=======
+from utils import BasicBlock, Bottleneck, BBoxTransform, ClipBoxes
+from anchors import Anchors
+import losses
+from encoders import SeResNetXtEncoder, ResNetEncoder
+>>>>>>> cf129a0aec86474c0301cb1640bd781f2d58f640
 
 model_urls = {
     'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
@@ -180,6 +187,7 @@ class GlobalClassificationModel(nn.Module):
         self.conv1 = nn.Conv2d(num_features_in, feature_size, kernel_size=3, dilation=1, padding=0)
         self.fc = nn.Linear(feature_size*2, num_classes)
         self.output_act = nn.LogSoftmax(dim=-1)
+<<<<<<< HEAD
 
         self.dropout = dropout
 
@@ -204,6 +212,32 @@ class GlobalClassificationModel(nn.Module):
 
         return out
 
+=======
+
+        self.dropout = dropout
+
+    def forward(self, x):
+        out = F.max_pool2d(x, 2)
+        out = self.conv1(out)
+        out = F.relu(out)
+
+        # if self.dropout > 0:
+        #     out = F.dropout(out, self.dropout, self.training)
+
+        avg_pool = F.avg_pool2d(out, out.shape[2:])
+        max_pool = F.max_pool2d(out, out.shape[2:])
+        avg_max_pool = torch.cat((avg_pool, max_pool), 1)
+        out = avg_max_pool.view(avg_max_pool.size(0), -1)
+
+        if self.dropout > 0:
+            out = F.dropout(out, self.dropout, self.training)
+
+        out = self.fc(out)
+        out = self.output_act(out)
+
+        return out
+
+>>>>>>> cf129a0aec86474c0301cb1640bd781f2d58f640
 class RetinaNetEncoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -218,6 +252,7 @@ class RetinaNetEncoder(nn.Module):
 
 class RetinaNet(nn.Module):
 
+<<<<<<< HEAD
     def __init__(self, encoder: RetinaNetEncoder, num_classes, dropout_cls=0.5, dropout_global_cls=0.5, use_l2_features=True):
         self.inplanes = 64
         super(RetinaNet, self).__init__()
@@ -228,10 +263,29 @@ class RetinaNet(nn.Module):
         self.use_l2_features = use_l2_features
 
         self.fpn = PyramidFeatures(fpn_sizes[0], fpn_sizes[1], fpn_sizes[2], fpn_sizes[3], use_l2_features=use_l2_features)
+=======
+    def __init__(self, encoder: RetinaNetEncoder, num_classes, block, layers, dropout_cls=0.5, dropout_global_cls=0.5, use_l2_features=True):
+        self.inplanes = 64
+        super(RetinaNet, self).__init__()
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+
+        fpn_sizes = encoder.fpn_sizes
+        self.use_l2_features = use_l2_features
+
+        self.fpn = PyramidFeatures(fpn_sizes[0], fpn_sizes[1], fpn_sizes[2], use_l2_features=use_l2_features)
+>>>>>>> cf129a0aec86474c0301cb1640bd781f2d58f640
 
         self.regressionModel = RegressionModel(256)
         self.classificationModel = ClassificationModel(256, num_classes=num_classes, dropout=dropout_cls)
 
+<<<<<<< HEAD
         self.globalClassificationModel = GlobalClassificationModel(fpn_sizes[-1], num_classes=num_classes, feature_size=256, dropout=dropout_global_cls)
         self.globalClassificationLoss = nn.NLLLoss()
 
@@ -239,6 +293,10 @@ class RetinaNet(nn.Module):
             pyramid_levels = [2, 3, 4, 5, 6, 7]
         else:
             pyramid_levels = [3, 4, 5, 6, 7]
+=======
+        self.globalClassificationModel = GlobalClassificationModel(fpn_sizes[-1], num_classes=3, feature_size=256, dropout=dropout_global_cls)
+        self.globalClassificationLoss = nn.NLLLoss()
+>>>>>>> cf129a0aec86474c0301cb1640bd781f2d58f640
 
         self.anchors = Anchors(pyramid_levels=pyramid_levels)
 
@@ -318,15 +376,27 @@ class RetinaNet(nn.Module):
             finalAnchorBoxesIndexesValue = torch.tensor([i] * anchors_nms_idx.shape[0])
             if torch.cuda.is_available():
                 finalAnchorBoxesIndexesValue = finalAnchorBoxesIndexesValue.cuda()
+<<<<<<< HEAD
+=======
+
+            finalAnchorBoxesIndexes = torch.cat((finalAnchorBoxesIndexes, finalAnchorBoxesIndexesValue))
+            finalAnchorBoxesCoordinates = torch.cat((finalAnchorBoxesCoordinates, anchorBoxes[anchors_nms_idx]))
+
+        return [finalScores, finalAnchorBoxesIndexes, finalAnchorBoxesCoordinates]
+>>>>>>> cf129a0aec86474c0301cb1640bd781f2d58f640
 
             finalAnchorBoxesIndexes = torch.cat((finalAnchorBoxesIndexes, finalAnchorBoxesIndexesValue))
             finalAnchorBoxesCoordinates = torch.cat((finalAnchorBoxesCoordinates, anchorBoxes[anchors_nms_idx]))
 
         return [finalScores, finalAnchorBoxesIndexes, finalAnchorBoxesCoordinates]
 
+<<<<<<< HEAD
     def forward(self, inputs, return_loss, return_boxes, return_raw=False):
 
         if return_loss:
+=======
+        if self.training:
+>>>>>>> cf129a0aec86474c0301cb1640bd781f2d58f640
             img_batch, annotations, global_annotations = inputs
         else:
             img_batch = inputs
@@ -343,6 +413,7 @@ class RetinaNet(nn.Module):
         classification = torch.cat([self.classificationModel(feature) for feature in features], dim=1)
 
         global_classification = self.globalClassificationModel(x4)
+<<<<<<< HEAD
 
         anchors = self.anchors(img_batch)
 
@@ -356,6 +427,18 @@ class RetinaNet(nn.Module):
             result += [self.globalClassificationLoss(global_classification, global_annotations)]
 
         if return_boxes:
+=======
+
+        anchors = self.anchors(img_batch)
+
+        result = []
+
+        if self.training:
+            result += self.focalLoss(classification, regression, anchors, annotations)
+            result += [self.globalClassificationLoss(global_classification, global_annotations)]
+
+        else:
+>>>>>>> cf129a0aec86474c0301cb1640bd781f2d58f640
             result += self.boxes(img_batch, regression, classification, global_classification, anchors)
 
         return result
@@ -368,7 +451,11 @@ def resnet18(num_classes, pretrained=False, **kwargs):
     """
     encoder = ResNetEncoder(BasicBlock, [2, 2, 2, 2])
     if pretrained:
+<<<<<<< HEAD
         encoder.load_state_dict(model_zoo.load_url(model_urls['resnet18'], model_dir='.'), strict=False)
+=======
+        model.load_state_dict(model_zoo.load_url(model_urls['resnet18'], model_dir='.'), strict=False)
+>>>>>>> cf129a0aec86474c0301cb1640bd781f2d58f640
     model = RetinaNet(encoder=encoder, num_classes=num_classes)
     return model
 
@@ -380,7 +467,11 @@ def resnet34(num_classes, pretrained=False, **kwargs):
     """
     encoder = ResNetEncoder(BasicBlock, [3, 4, 6, 3])
     if pretrained:
+<<<<<<< HEAD
         encoder.load_state_dict(model_zoo.load_url(model_urls['resnet34'], model_dir='.'), strict=False)
+=======
+        model.load_state_dict(model_zoo.load_url(model_urls['resnet34'], model_dir='.'), strict=False)
+>>>>>>> cf129a0aec86474c0301cb1640bd781f2d58f640
     model = RetinaNet(encoder=encoder, num_classes=num_classes)
     return model
 
@@ -392,7 +483,11 @@ def resnet50(num_classes, pretrained=False, **kwargs):
     """
     encoder = ResNetEncoder(Bottleneck, [3, 4, 6, 3])
     if pretrained:
+<<<<<<< HEAD
         encoder.load_state_dict(model_zoo.load_url(model_urls['resnet50'], model_dir='.'), strict=False)
+=======
+        model.load_state_dict(model_zoo.load_url(model_urls['resnet50'], model_dir='.'), strict=False)
+>>>>>>> cf129a0aec86474c0301cb1640bd781f2d58f640
     model = RetinaNet(encoder=encoder, num_classes=num_classes, **kwargs)
     return model
 
@@ -404,7 +499,11 @@ def resnet101(num_classes, pretrained=False, **kwargs):
     """
     encoder = ResNetEncoder(Bottleneck, [3, 4, 23, 3])
     if pretrained:
+<<<<<<< HEAD
         encoder.load_state_dict(model_zoo.load_url(model_urls['resnet101'], model_dir='.'), strict=False)
+=======
+        model.load_state_dict(model_zoo.load_url(model_urls['resnet101'], model_dir='.'), strict=False)
+>>>>>>> cf129a0aec86474c0301cb1640bd781f2d58f640
     model = RetinaNet(encoder=encoder, num_classes=num_classes, **kwargs)
     return model
 
