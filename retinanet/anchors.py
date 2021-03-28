@@ -9,6 +9,9 @@ class Anchors(nn.Module):
 
         if pyramid_levels is None:
             self.pyramid_levels = [3, 4, 5, 6, 7]
+        else:
+            self.pyramid_levels = pyramid_levels
+            
         if strides is None:
             self.strides = [2 ** x for x in self.pyramid_levels]
         if sizes is None:

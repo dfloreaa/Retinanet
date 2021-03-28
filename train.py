@@ -1,180 +1,653 @@
 import argparse
 import collections
+import os
+import pandas as pd
+import skimage.transform
 
 import numpy as np
 
+from comet_ml import Experiment
+
 import torch
 import torch.optim as optim
-from torchvision import transforms
+from torch.optim import lr_scheduler
+from torchvision import transforms, datasets, models
+from tqdm import tqdm
 
 from retinanet import model
 from retinanet.dataloader import CocoDataset, CSVDataset, collater, Resizer, AspectRatioBasedSampler, Augmenter, \
-    Normalizer
+    Normalizer, collater2d
 from torch.utils.data import DataLoader
 
 from retinanet import coco_eval
 from retinanet import csv_eval
 
+from config import CROP_SIZE, TEST_DIR
+from detection_dataset import DetectionDataset
+
 assert torch.__version__.split('.')[0] == '1'
 
+os.environ["CUDA_VISIBLE_DEVICES"]= "0"
+torch.set_num_threads(1)
 print('CUDA available: {}'.format(torch.cuda.is_available()))
 
+class ModelInfo:
+    def __init__(self,
+                 factory,
+                 args,
+                 batch_size,
+                 dataset_args,
+                 use_sgd=False,
+                 img_size=512):
+        self.factory = factory
+        self.args = args
+        self.batch_size = batch_size
+        self.dataset_args = dataset_args
+        self.img_size = img_size
+        self.use_sgd = use_sgd
 
-def main(args=None):
-    parser = argparse.ArgumentParser(description='Simple training script for training a RetinaNet network.')
+MODELS = {
+    'resnet34_512': ModelInfo(
+        factory=model.resnet34,
+        args=dict(num_classes=15, pretrained=True),
+        img_size=512,
+        batch_size=8,
+        dataset_args=dict()
+    ),
+    'resnet50_512': ModelInfo(
+        factory=model.resnet50,
+        args=dict(num_classes=15, pretrained=True, dropout_cls=0.5, dropout_global_cls=0.5),
+        img_size=512,
+        batch_size=12,
+        dataset_args=dict(augmentation_level=15)
+    ),
+    'resnet101_512': ModelInfo(
+        factory=model.resnet101,
+        args=dict(num_classes=15, pretrained=True),
+        img_size=512,
+        batch_size=30,
+        dataset_args=dict(augmentation_level=20)
+    ),
+    'resnet152_512': ModelInfo(
+        factory=model.resnet152,
+        args=dict(num_classes=15, pretrained=True),
+        img_size=512,
+        batch_size=12,
+        dataset_args=dict()
+    ),
+    'se_resnext101_512': ModelInfo(
+        factory=model.se_resnext101,
+        args=dict(num_classes=15, pretrained='imagenet'),
+        img_size=512,
+        batch_size=12,
+        dataset_args=dict()
+    ),
+    'se_resnext101_dr_512': ModelInfo(
+        factory=model.se_resnext101,
+        args=dict(num_classes=15, pretrained='imagenet', dropout=0.5),
+        img_size=512,
+        batch_size=12,
+        dataset_args=dict(augmentation_level=20)
+    ),
+    'se_resnext101_dr_512_without_pretrained': ModelInfo(
+        factory=model.se_resnext101,
+        args=dict(num_classes=15, pretrained=False, dropout=0.5),
+        img_size=512,
+        batch_size=12,
+        dataset_args=dict(augmentation_level=20)
+    ),
+    'se_resnext101_512_bs12_aug20': ModelInfo(
+        factory=model.se_resnext101,
+        args=dict(num_classes=15, pretrained='imagenet'),
+        img_size=512,
+        batch_size=12,
+        dataset_args=dict(augmentation_level=20)
+    ),
+    'se_resnext101_512_sgd': ModelInfo(
+        factory=model.se_resnext101,
+        args=dict(num_classes=15, pretrained='imagenet', dropout=0.5),
+        img_size=512,
+        batch_size=12,
+        use_sgd=True,
+        dataset_args=dict(augmentation_level=15)
+    ),
+    'se_resnext50_512': ModelInfo(
+        factory=model.se_resnext50,
+        args=dict(num_classes=15, pretrained='imagenet', dropout=0.5),
+        img_size=512,
+        batch_size=8,
+        dataset_args=dict(augmentation_level=20)
+    ),
+}
 
-    parser.add_argument('--dataset', help='Dataset type, must be one of csv or coco.')
-    parser.add_argument('--coco_path', help='Path to COCO directory')
-    parser.add_argument('--csv_train', help='Path to file containing training annotations (see readme)')
-    parser.add_argument('--csv_classes', help='Path to file containing class list (see readme)')
-    parser.add_argument('--csv_val', help='Path to file containing validation annotations (optional, see readme)')
+def train(model_name, fold, run=None, resume_weights='', resume_epoch=0):
+    model_info = MODELS[model_name]
 
-    parser.add_argument('--depth', help='Resnet depth, must be one of 18, 34, 50, 101, 152', type=int, default=50)
-    parser.add_argument('--epochs', help='Number of epochs', type=int, default=100)
+    run_str = '' if run is None or run == '' else '_' + str(run)
 
-    parser = parser.parse_args(args)
+    checkpoints_dir = f'checkpoints/{model_name}{run_str}_fold_{fold}'
+    predictions_dir = f'output/{model_name}{run_str}_fold_{fold}'
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    os.makedirs(predictions_dir, exist_ok=True)
+    print('\n', model_name, '\n')
 
-    # Create the data loaders
-    if parser.dataset == 'coco':
+    experiment = Experiment("tOknE6TOEkPHgnjtMFQbprX64")
 
-        if parser.coco_path is None:
-            raise ValueError('Must provide --coco_path when training on COCO,')
+    retinanet = model_info.factory(**model_info.args)
 
-        dataset_train = CocoDataset(parser.coco_path, set_name='train2017',
-                                    transform=transforms.Compose([Normalizer(), Augmenter(), Resizer()]))
-        dataset_val = CocoDataset(parser.coco_path, set_name='val2017',
-                                  transform=transforms.Compose([Normalizer(), Resizer()]))
-
-    elif parser.dataset == 'csv':
-
-        if parser.csv_train is None:
-            raise ValueError('Must provide --csv_train when training on COCO,')
-
-        if parser.csv_classes is None:
-            raise ValueError('Must provide --csv_classes when training on COCO,')
-
-        dataset_train = CSVDataset(train_file=parser.csv_train, class_list=parser.csv_classes,
-                                   transform=transforms.Compose([Normalizer(), Augmenter(), Resizer()]))
-
-        if parser.csv_val is None:
-            dataset_val = None
-            print('No validation annotations provided.')
-        else:
-            dataset_val = CSVDataset(train_file=parser.csv_val, class_list=parser.csv_classes,
-                                     transform=transforms.Compose([Normalizer(), Resizer()]))
-
+    if resume_weights != '':
+        print('load model from', resume_weights)
+        retinanet = torch.load(resume_weights).cuda()
     else:
-        raise ValueError('Dataset type not understood (must be csv or coco), exiting.')
+        retinanet = retinanet.cuda()
 
-    sampler = AspectRatioBasedSampler(dataset_train, batch_size=2, drop_last=False)
-    dataloader_train = DataLoader(dataset_train, num_workers=3, collate_fn=collater, batch_sampler=sampler)
+    retinanet = torch.nn.DataParallel(retinanet).cuda()
 
-    if dataset_val is not None:
-        sampler_val = AspectRatioBasedSampler(dataset_val, batch_size=1, drop_last=False)
-        dataloader_val = DataLoader(dataset_val, num_workers=3, collate_fn=collater, batch_sampler=sampler_val)
+    dataset_train = DetectionDataset(fold=fold, img_size=model_info.img_size, is_training=True, images={}, **model_info.dataset_args)
+    dataset_valid = DetectionDataset(fold=fold, img_size=model_info.img_size, is_training=False, images={})
 
-    # Create the model
-    if parser.depth == 18:
-        retinanet = model.resnet18(num_classes=dataset_train.num_classes(), pretrained=True)
-    elif parser.depth == 34:
-        retinanet = model.resnet34(num_classes=dataset_train.num_classes(), pretrained=True)
-    elif parser.depth == 50:
-        retinanet = model.resnet50(num_classes=dataset_train.num_classes(), pretrained=True)
-    elif parser.depth == 101:
-        retinanet = model.resnet101(num_classes=dataset_train.num_classes(), pretrained=True)
-    elif parser.depth == 152:
-        retinanet = model.resnet152(num_classes=dataset_train.num_classes(), pretrained=True)
-    else:
-        raise ValueError('Unsupported model depth, must be one of 18, 34, 50, 101, 152')
+    dataloader_train = DataLoader(dataset_train,
+                                  num_workers=4,
+                                  batch_size=model_info.batch_size,
+                                  shuffle=True,
+                                  drop_last=True,
+                                  collate_fn=collater2d)
 
-    use_gpu = True
-
-    if use_gpu:
-        if torch.cuda.is_available():
-            retinanet = retinanet.cuda()
-
-    if torch.cuda.is_available():
-        retinanet = torch.nn.DataParallel(retinanet).cuda()
-    else:
-        retinanet = torch.nn.DataParallel(retinanet)
+    dataloader_valid = DataLoader(dataset_valid,
+                                  num_workers=4,
+                                  batch_size=4,
+                                  shuffle=False,
+                                  drop_last=True,
+                                  collate_fn=collater2d)
 
     retinanet.training = True
 
-    optimizer = optim.Adam(retinanet.parameters(), lr=1e-5)
-
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
-
-    loss_hist = collections.deque(maxlen=500)
+    if model_info.use_sgd:
+        # multi_lr
+        # optimizer = optim.SGD([
+        #         {'params': retinanet.module.encoder.parameters(), 'lr': 2e-4},
+        #         {'params': retinanet.module.fpn.parameters(), 'lr': 1e-3},
+        #         {'params': retinanet.module.regressionModel.parameters(), 'lr': 2e-3},
+        #         {'params': retinanet.module.classificationModel.parameters(), 'lr': 1e-3},
+        #         {'params': retinanet.module.globalClassificationModel.parameters(), 'lr': 1e-3},
+        #     ], lr=1e-3, momentum=0.95)
+        # multi_lr2
+        optimizer = optim.SGD([
+            {'params': retinanet.module.encoder.parameters(), 'lr': 2e-3},
+            {'params': retinanet.module.fpn.parameters(), 'lr': 1e-2},
+            {'params': retinanet.module.regressionModel.parameters(), 'lr': 2e-2},
+            {'params': retinanet.module.classificationModel.parameters(), 'lr': 1e-2},
+            {'params': retinanet.module.globalClassificationModel.parameters(), 'lr': 1e-2},
+        ], lr=1e-3, momentum=0.95)
+        # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=4, verbose=True, factor=0.1)
+        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[8, 16, 20])
+        scheduler_by_epoch = True
+    else:
+        optimizer = optim.Adam(retinanet.parameters(), lr=1e-5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=4, verbose=True, factor=0.2)
+        scheduler_by_epoch = False
 
     retinanet.train()
     retinanet.module.freeze_bn()
 
     print('Num training images: {}'.format(len(dataset_train)))
+    epochs = 20
 
-    for epoch_num in range(parser.epochs):
+    for epoch_num in range(resume_epoch+1, epochs):
 
         retinanet.train()
+        if epoch_num < 1:
+            retinanet.module.freeze_encoder()
+        else:
+            retinanet.module.unfreeze_encoder()
+
         retinanet.module.freeze_bn()
 
         epoch_loss = []
+        loss_cls_hist = []
+        loss_cls_global_hist = []
+        loss_reg_hist = []
 
-        for iter_num, data in enumerate(dataloader_train):
-            try:
+        with torch.set_grad_enabled(True):
+            data_iter = tqdm(enumerate(dataloader_train), total=len(dataloader_train))
+            for iter_num, data in data_iter:
                 optimizer.zero_grad()
+                inputs = [data['img'].cuda().float(), data['annot'].cuda().float(), data['category'].cuda()]
+                # print([i.shape for i in inputs])
 
-                if torch.cuda.is_available():
-                    classification_loss, regression_loss = retinanet([data['img'].cuda().float(), data['annot']])
-                else:
-                    classification_loss, regression_loss = retinanet([data['img'].float(), data['annot']])
-                    
+                classification_loss, regression_loss, global_classification_loss = \
+                    retinanet(inputs, return_loss=True, return_boxes=False)
+
                 classification_loss = classification_loss.mean()
                 regression_loss = regression_loss.mean()
+                global_classification_loss = global_classification_loss.mean()
 
-                loss = classification_loss + regression_loss
+                loss = classification_loss + regression_loss + global_classification_loss * 0.1
 
-                if bool(loss == 0):
-                    continue
+                # if bool(loss == 0):
+                #     continue
 
                 loss.backward()
 
-                torch.nn.utils.clip_grad_norm_(retinanet.parameters(), 0.1)
+                torch.nn.utils.clip_grad_norm_(retinanet.parameters(), 0.05)
 
                 optimizer.step()
 
-                loss_hist.append(float(loss))
-
+                loss_cls_hist.append(float(classification_loss))
+                loss_cls_global_hist.append(float(global_classification_loss))
+                loss_reg_hist.append(float(regression_loss))
                 epoch_loss.append(float(loss))
 
-                print(
-                    'Epoch: {} | Iteration: {} | Classification loss: {:1.5f} | Regression loss: {:1.5f} | Running loss: {:1.5f}'.format(
-                        epoch_num, iter_num, float(classification_loss), float(regression_loss), np.mean(loss_hist)))
+                data_iter.set_description(
+                    f'{epoch_num} cls: {np.mean(loss_cls_hist):1.4f} cls g: {np.mean(loss_cls_global_hist):1.4f} Reg: {np.mean(loss_reg_hist):1.4f} Loss: {np.mean(epoch_loss):1.4f}')
 
                 del classification_loss
                 del regression_loss
-            except Exception as e:
-                print(e)
-                continue
 
-        if parser.dataset == 'coco':
+        torch.save(retinanet.module, f'{checkpoints_dir}/{model_name}_{epoch_num:03}.pt')
 
-            print('Evaluating dataset')
+        experiment.log_metric('loss_train', np.mean(epoch_loss), step = epoch_num)
+        experiment.log_metric('loss_train_classification', np.mean(loss_cls_hist), step = epoch_num)
+        experiment.log_metric('loss_train_global_classification', np.mean(loss_cls_global_hist), step = epoch_num)
+        experiment.log_metric('loss_train_regression', np.mean(loss_reg_hist), step = epoch_num)
 
-            coco_eval.evaluate_coco(dataset_val, retinanet)
+        # validation
+        with torch.no_grad():
+            retinanet.eval()
 
-        elif parser.dataset == 'csv' and parser.csv_val is not None:
+            loss_hist_valid = []
+            loss_cls_hist_valid = []
+            loss_cls_global_hist_valid = []
+            loss_reg_hist_valid = []
 
-            print('Evaluating dataset')
+            # oof = collections.defaultdict(list)
 
-            mAP = csv_eval.evaluate(dataset_val, retinanet)
+            data_iter = tqdm(enumerate(dataloader_valid), total=len(dataloader_valid))
+            for iter_num, data in data_iter:
+                res = retinanet([data['img'].cuda().float(), data['annot'].cuda().float(), data['category'].cuda()],
+                                       return_loss=True, return_boxes=False)
+                # classification_loss, regression_loss, global_classification_loss, nms_scores, global_class, transformed_anchors = res
+                classification_loss, regression_loss, global_classification_loss = res
 
-        scheduler.step(np.mean(epoch_loss))
 
-        torch.save(retinanet.module, '{}_retinanet_{}.pt'.format(parser.dataset, epoch_num))
+                # oof['gt_boxes'].append(data['annot'].cpu().numpy().copy())
+                # oof['gt_category'].append(data['category'].cpu().numpy().copy())
+                # oof['boxes'].append(transformed_anchors.cpu().numpy().copy())
+                # oof['scores'].append(nms_scores.cpu().numpy().copy())
+                # oof['category'].append(global_class.cpu().numpy().copy())
+
+                classification_loss = classification_loss.mean()
+                regression_loss = regression_loss.mean()
+                global_classification_loss = global_classification_loss.mean()
+                loss = classification_loss + regression_loss + global_classification_loss * 0.1
+
+                loss_hist_valid.append(float(loss))
+                loss_cls_hist_valid.append(float(classification_loss))
+                loss_cls_global_hist_valid.append(float(global_classification_loss))
+                loss_reg_hist_valid.append(float(regression_loss))
+
+                data_iter.set_description(
+                    f'{epoch_num} cls: {np.mean(loss_cls_hist_valid):1.4f} cls g: {np.mean(loss_cls_global_hist_valid):1.4f} Reg: {np.mean(loss_reg_hist_valid):1.4f} Loss {np.mean(loss_hist_valid):1.4f}')
+
+                del classification_loss
+                del regression_loss
+
+            experiment.log_metric('loss_valid', np.mean(loss_hist_valid), step = epoch_num)
+            experiment.log_metric('loss_valid_classification', np.mean(loss_cls_hist_valid), step = epoch_num)
+            experiment.log_metric('loss_valid_global_classification', np.mean(loss_cls_global_hist_valid), step = epoch_num)
+            experiment.log_metric('loss_valid_regression', np.mean(loss_reg_hist_valid), step = epoch_num)
+
+            # pickle.dump(oof, open(f'{predictions_dir}/{epoch_num:03}.pkl', 'wb'))
+            #
+            # np.savez(f'{predictions_dir}/{epoch_num:03}.npz',
+            #          gt_boxes=np.concatenate(oof['gt_boxes'], axis=0),
+            #          gt_category=np.concatenate(oof['gt_category'], axis=0),
+            #          boxes=np.concatenate(oof['boxes'], axis=0),
+            #          scores=np.concatenate(oof['scores'], axis=0),
+            #          category=np.concatenate(oof['category'], axis=0)
+            #          )
+
+        if scheduler_by_epoch:
+            scheduler.step(epoch=epoch_num)
+        else:
+            scheduler.step(np.mean(loss_reg_hist_valid))
+        # if epoch_num % 4 == 0:
+
 
     retinanet.eval()
+    torch.save(retinanet, f'{checkpoints_dir}/{model_name}_end.pt')
 
-    torch.save(retinanet, 'model_final.pt')
+def check(model_name, fold, checkpoint):
+    model_info = MODELS[model_name]
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+    model = torch.load(checkpoint, map_location=device)
+    model = model.to(device)
+    model.eval()
+
+    dataset_valid = DetectionDataset(fold=fold, img_size=model_info.img_size, is_training=False,
+                                     images={})
+
+    dataloader_valid = DataLoader(dataset_valid,
+                                  num_workers=1,
+                                  batch_size=1,
+                                  shuffle=False,
+                                  collate_fn=collater2d)
+
+    data_iter = tqdm(enumerate(dataloader_valid), total=len(dataloader_valid))
+    for iter_num, data in data_iter:
+        classification_loss, regression_loss, global_classification_loss, nms_scores, nms_class, transformed_anchors = \
+            model([data['img'].to(device).float(), data['annot'].to(device).float(), data['category'].cuda()],
+                  return_loss=True, return_boxes=True)
+
+        nms_scores = nms_scores.cpu().detach().numpy()
+        nms_class = nms_class.cpu().detach().numpy()
+        transformed_anchors = transformed_anchors.cpu().detach().numpy()
+
+        print(nms_scores, transformed_anchors.shape)
+        print('cls loss:', float(classification_loss), 'global cls loss:', global_classification_loss, ' reg loss:', float(regression_loss))
+        print('cat:', data['category'].numpy()[0], np.exp(nms_class[0]), dataset_valid.categories[data['category'][0]])
+
+        plt.cla()
+        plt.imshow(data['img'][0, 0].cpu().detach().numpy())
+
+        gt = data['annot'].cpu().detach().numpy()[0]
+        for i in range(gt.shape[0]):
+            if np.all(np.isfinite(gt[i])):
+                p0 = gt[i, 0:2]
+                p1 = gt[i, 2:4]
+                plt.gca().add_patch(
+                    plt.Rectangle(p0, width=(p1 - p0)[0], height=(p1 - p0)[1], fill=False, edgecolor='b', linewidth=2))
+
+        for i in range(len(nms_scores)):
+            nms_score = nms_scores[i]
+            if nms_score < 0.1:
+                break
+            # print(transformed_anchors[i, :])
+
+            p0 = transformed_anchors[i, 0:2]
+            p1 = transformed_anchors[i, 2:4]
+
+            color = 'g'
+            if nms_score < 0.4:
+                color = 'y'
+            if nms_score < 0.25:
+                color = 'r'
+
+            # print(p0, p1)
+            plt.gca().add_patch(plt.Rectangle(p0, width=(p1-p0)[0], height=(p1-p0)[1], fill=False, edgecolor=color, linewidth=2))
+            plt.gca().text(p0[0], p0[1], f'{nms_score:.3f}', color=color)  # , bbox={'facecolor': color, 'alpha': 0.5})
+        plt.show()
+
+        print(nms_scores)
+
+def generate_predictions(model_name, run, fold, from_epoch=0, to_epoch=100):
+    run_str = '' if run is None or run == '' else f'_{run}'
+    predictions_dir = f'../output/oof2/{model_name}{run_str}_fold_{fold}'
+    os.makedirs(predictions_dir, exist_ok=True)
+
+    model_info = MODELS[model_name]
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    for epoch_num in range(from_epoch, to_epoch):
+        prediction_fn = f'{predictions_dir}/{epoch_num:03}.pkl'
+        if os.path.exists(prediction_fn):
+            continue
+        print('epoch', epoch_num)
+        checkpoint = f'checkpoints/{model_name}{run_str}_fold_{fold}/{model_name}_{epoch_num:03}.pt'
+        print('load', checkpoint)
+        try:
+            model = torch.load(checkpoint, map_location=device)
+        except FileNotFoundError:
+            break
+        model = model.to(device)
+        model.eval()
+
+        dataset_valid = DetectionDataset(fold=fold, img_size=model_info.img_size, is_training=False,
+                                         images={})
+
+        dataloader_valid = DataLoader(dataset_valid,
+                                      num_workers=2,
+                                      batch_size=1,
+                                      shuffle=False,
+                                      collate_fn=pytorch_retinanet.dataloader.collater2d)
+
+        oof = collections.defaultdict(list)
+
+        # for iter_num, data in tqdm(enumerate(dataloader_valid), total=len(dataloader_valid)):
+        for iter_num, data in tqdm(enumerate(dataset_valid), total=len(dataloader_valid)):
+            data = pytorch_retinanet.dataloader.collater2d([data])
+            img = data['img'].to(device).float()
+            nms_scores, global_classification, transformed_anchors = \
+                model(img, return_loss=False, return_boxes=True)
+
+            nms_scores = nms_scores.cpu().detach().numpy()
+            global_classification = global_classification.cpu().detach().numpy()
+            transformed_anchors = transformed_anchors.cpu().detach().numpy()
+
+            oof['gt_boxes'].append(data['annot'].cpu().detach().numpy())
+            oof['gt_category'].append(data['category'].cpu().detach().numpy())
+
+            oof['boxes'].append(transformed_anchors)
+            oof['scores'].append(nms_scores)
+            oof['category'].append(global_classification)
+
+        pickle.dump(oof, open(prediction_fn, 'wb'))
+
+def p1p2_to_xywh(p1p2):
+    xywh = np.zeros((p1p2.shape[0], 4))
+
+    xywh[:, :2] = p1p2[:, :2]
+    xywh[:, 2:4] = p1p2[:, 2:4] - p1p2[:, :2]
+    return xywh
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('action', type=str, default='check')
+    parser.add_argument('--model', type=str, default='')
+    parser.add_argument('--run', type=str, default='')
+    parser.add_argument('--fold', type=int, default=-1)
+    parser.add_argument('--weights', type=str, default='')
+    parser.add_argument('--epoch', type=int, default=-1)
+    parser.add_argument('--from-epoch', type=int, default=0)
+    parser.add_argument('--to-epoch', type=int, default=100)
+    parser.add_argument('--threshold', type=float, default=0.3)
+    parser.add_argument('--submission', type=str, default='')
+
+    parser.add_argument('--resume_weights', type=str, default='')
+    parser.add_argument('--resume_epoch', type=int, default=-1)
+
+    args = parser.parse_args()
+    action = args.action
+    model = args.model
+    fold = args.fold
+
+    if action == 'train':
+        train(model_name=model, run=args.run, fold=args.fold, resume_weights=args.resume_weights, resume_epoch=args.resume_epoch)
+
+    if action == 'check':
+        if args.epoch > -1:
+            run_str = '' if args.run is None or args.run == '' else f'_{args.run}'
+            weights = f'checkpoints/{args.model_name}{run_str}_fold_{fold}/{args.model_name}_{args.epoch:03}.pt'
+        else:
+            weights = args.weighs
+
+        check(model_name=model, fold=args.fold, checkpoint=weights)
+
+    if action == 'check_metric':
+        check_metric(model_name=model, run=args.run, fold=args.fold)
+
+    if action == 'generate_predictions':
+        generate_predictions(model_name=model, run=args.run, fold=args.fold,
+                             from_epoch=args.from_epoch, to_epoch=args.to_epoch)
+
+# def main(args=None):
+#     parser = argparse.ArgumentParser(description='Simple training script for training a RetinaNet network.')
+
+#     # parser.add_argument('--dataset', help='Dataset type, must be one of csv or coco.')
+#     parser.add_argument('--coco_path', help='Path to COCO directory')
+#     parser.add_argument('--csv_train', help='Path to file containing training annotations (see readme)')
+#     parser.add_argument('--csv_classes', help='Path to file containing class list (see readme)')
+#     parser.add_argument('--csv_val', help='Path to file containing validation annotations (optional, see readme)')
+
+#     parser.add_argument('--depth', help='Resnet depth, must be one of 18, 34, 50, 101, 152', type=int, default=50)
+#     parser.add_argument('--epochs', help='Number of epochs', type=int, default=100)
+
+#     parser = parser.parse_args(args)
+
+#     # Create the data loaders
+#     # if parser.dataset == 'coco':
+
+#     #     if parser.coco_path is None:
+#     #         raise ValueError('Must provide --coco_path when training on COCO,')
+
+#     #     dataset_train = CocoDataset(parser.coco_path, set_name='train2017',
+#     #                                 transform=transforms.Compose([Normalizer(), Augmenter(), Resizer()]))
+#     #     dataset_val = CocoDataset(parser.coco_path, set_name='val2017',
+#     #                               transform=transforms.Compose([Normalizer(), Resizer()]))
+
+#     # elif parser.dataset == 'csv':
+
+#     #     if parser.csv_train is None:
+#     #         raise ValueError('Must provide --csv_train when training on COCO,')
+
+#     #     if parser.csv_classes is None:
+#     #         raise ValueError('Must provide --csv_classes when training on COCO,')
+
+#     #     dataset_train = CSVDataset(train_file=parser.csv_train, class_list=parser.csv_classes,
+#     #                                transform=transforms.Compose([Normalizer(), Augmenter(), Resizer()]))
+
+#     #     if parser.csv_val is None:
+#     #         dataset_val = None
+#     #         print('No validation annotations provided.')
+#     #     else:
+#     #         dataset_val = CSVDataset(train_file=parser.csv_val, class_list=parser.csv_classes,
+#     #                                  transform=transforms.Compose([Normalizer(), Resizer()]))
+
+#     # else:
+#     #     raise ValueError('Dataset type not understood (must be csv or coco), exiting.')
+
+#     dataset_train = DetectionDataset(fold=fold, img_size=model_info.img_size, is_training=True, images={}, **model_info.dataset_args)
+#     dataset_val = DetectionDataset(fold=fold, img_size=model_info.img_size, is_training=False, images={})
+
+#     dataloader_train = DataLoader(dataset_train,
+#                                    num_workers=16,
+#                                    batch_size=model_info.batch_size,
+#                                    shuffle=True,
+#                                    drop_last=True,
+#                                    collate_fn=collater2d)
+
+
+#     if dataset_val is not None:
+#             dataloader_valid = DataLoader(dataset_valid,
+#                                    num_workers=8,
+#                                    batch_size=4,
+#                                    shuffle=False,
+#                                    drop_last=True,
+#                                    collate_fn=collater2d)
+
+#     # Create the model
+#     if parser.depth == 18:
+#         retinanet = model.resnet18(num_classes=dataset_train.num_classes(), pretrained=True)
+#     elif parser.depth == 34:
+#         retinanet = model.resnet34(num_classes=dataset_train.num_classes(), pretrained=True)
+#     elif parser.depth == 50:
+#         retinanet = model.resnet50(num_classes=dataset_train.num_classes(), pretrained=True)
+#     elif parser.depth == 101:
+#         retinanet = model.resnet101(num_classes=dataset_train.num_classes(), pretrained=True)
+#     elif parser.depth == 152:
+#         retinanet = model.resnet152(num_classes=dataset_train.num_classes(), pretrained=True)
+#     else:
+#         raise ValueError('Unsupported model depth, must be one of 18, 34, 50, 101, 152')
+
+#     use_gpu = True
+
+#     if use_gpu:
+#         if torch.cuda.is_available():
+#             retinanet = retinanet.cuda()
+
+#     if torch.cuda.is_available():
+#         retinanet = torch.nn.DataParallel(retinanet).cuda()
+#     else:
+#         retinanet = torch.nn.DataParallel(retinanet)
+
+#     retinanet.training = True
+
+#     optimizer = optim.Adam(retinanet.parameters(), lr=1e-5)
+
+#     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, verbose=True)
+
+#     loss_hist = collections.deque(maxlen=500)
+
+#     retinanet.train()
+#     retinanet.module.freeze_bn()
+
+#     print('Num training images: {}'.format(len(dataset_train)))
+
+#     for epoch_num in range(parser.epochs):
+
+#         retinanet.train()
+#         retinanet.module.freeze_bn()
+
+#         epoch_loss = []
+
+#         for iter_num, data in enumerate(dataloader_train):
+#             try:
+#                 optimizer.zero_grad()
+
+#                 if torch.cuda.is_available():
+#                     classification_loss, regression_loss = retinanet([data['img'].cuda().float(), data['annot']])
+#                 else:
+#                     classification_loss, regression_loss = retinanet([data['img'].float(), data['annot']])
+                    
+#                 classification_loss = classification_loss.mean()
+#                 regression_loss = regression_loss.mean()
+
+#                 loss = classification_loss + regression_loss
+
+#                 if bool(loss == 0):
+#                     continue
+
+#                 loss.backward()
+
+#                 torch.nn.utils.clip_grad_norm_(retinanet.parameters(), 0.1)
+
+#                 optimizer.step()
+
+#                 loss_hist.append(float(loss))
+
+#                 epoch_loss.append(float(loss))
+
+#                 print(
+#                     'Epoch: {} | Iteration: {} | Classification loss: {:1.5f} | Regression loss: {:1.5f} | Running loss: {:1.5f}'.format(
+#                         epoch_num, iter_num, float(classification_loss), float(regression_loss), np.mean(loss_hist)))
+
+#                 del classification_loss
+#                 del regression_loss
+#             except Exception as e:
+#                 print(e)
+#                 continue
+
+#         if parser.dataset == 'coco':
+
+#             print('Evaluating dataset')
+
+#             coco_eval.evaluate_coco(dataset_val, retinanet)
+
+#         elif parser.dataset == 'csv' and parser.csv_val is not None:
+
+#             print('Evaluating dataset')
+
+#             mAP = csv_eval.evaluate(dataset_val, retinanet)
+
+#         scheduler.step(np.mean(epoch_loss))
+
+#         torch.save(retinanet.module, '{}_retinanet_{}.pt'.format(parser.dataset, epoch_num))
+
+#     retinanet.eval()
+
+#     torch.save(retinanet, 'model_final.pt')
+
+
+# if __name__ == '__main__':
+#     main()
