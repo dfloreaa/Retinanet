@@ -50,36 +50,41 @@ class FocalLoss(nn.Module):
 
             if bbox_annotation.shape[0] == 0:
                 if torch.cuda.is_available():
-                    alpha_factor = torch.ones(classification.shape).cuda() * alpha
+                    # alpha_factor = torch.ones(classification.shape).cuda() * alpha
 
-                    alpha_factor = 1. - alpha_factor
-                    focal_weight = classification
-                    focal_weight = alpha_factor * torch.pow(focal_weight, gamma)
+                    # alpha_factor = 1. - alpha_factor
+                    # focal_weight = classification
+                    # focal_weight = alpha_factor * torch.pow(focal_weight, gamma)
 
                     bce = -(torch.log(1.0 - classification))
 
                     # cls_loss = focal_weight * torch.pow(bce, gamma)
-                    cls_loss = focal_weight * bce
-                    classification_losses.append(cls_loss.sum())
-                    regression_losses.append(torch.tensor(0).float())
+                    # cls_loss = focal_weight * bce
+                    # classification_losses.append(cls_loss.sum())
+                    # regression_losses.append(torch.tensor(0).float())
+                    IoU = torch.zeros(anchor.shape[0], 1).float().cuda()
+                    bbox_annotation = torch.ones(1, 5).float().cuda() * -1
                     
                 else:
-                    alpha_factor = torch.ones(classification.shape) * alpha
+                    # alpha_factor = torch.ones(classification.shape) * alpha
 
-                    alpha_factor = 1. - alpha_factor
-                    focal_weight = classification
-                    focal_weight = alpha_factor * torch.pow(focal_weight, gamma)
+                    # alpha_factor = 1. - alpha_factor
+                    # focal_weight = classification
+                    # focal_weight = alpha_factor * torch.pow(focal_weight, gamma)
 
-                    bce = -(torch.log(1.0 - classification))
+                    # bce = -(torch.log(1.0 - classification))
 
                     # cls_loss = focal_weight * torch.pow(bce, gamma)
-                    cls_loss = focal_weight * bce
-                    classification_losses.append(cls_loss.sum())
-                    regression_losses.append(torch.tensor(0).float())
+                    # cls_loss = focal_weight * bce
+                    # classification_losses.append(cls_loss.sum())
+                    # regression_losses.append(torch.tensor(0).float())
+                    IoU = torch.zeros(anchor.shape[0], 1).float().cuda()
+                    bbox_annotation = torch.ones(1, 5).float().cuda() * -1
                     
-                continue
+                #continue
 
-            IoU = calc_iou(anchors[0, :, :], bbox_annotation[:, :4]) # num_anchors x num_annotations
+            else:
+                IoU = calc_iou(anchors[0, :, :], bbox_annotation[:, :4]) # num_anchors x num_annotations
 
             IoU_max, IoU_argmax = torch.max(IoU, dim=1) # num_anchors x 1
 
